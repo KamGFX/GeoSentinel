@@ -22,10 +22,10 @@
 #define MPU_ADDR 0x68
 
 // ---------- WIFI / TELEGRAM ----------
-const char* WIFI_SSID = "CASA-6";
-const char* WIFI_PASS = "HG.27.SOCORRO";
+const char* WIFI_SSID = "nombre wifi";
+const char* WIFI_PASS = "contraseña wifi";
 
-const String BOT_TOKEN = "8769951849:AAF0aEVHre27v6hb_vQz23us2mSPI5Cjy5U";
+const String BOT_TOKEN = "Token";
 const String CHAT_ID   = "1514893281";
 // -------------------------------------
 
