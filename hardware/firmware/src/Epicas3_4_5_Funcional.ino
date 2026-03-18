@@ -5,6 +5,7 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
+#include <math.h>
 
 #define SS_PIN 21
 #define RST_PIN 22
@@ -21,11 +22,14 @@
 #define SCL_MPU 26
 #define MPU_ADDR 0x68
 
+#define PWR_MGMT_1   0x6B
+#define ACCEL_XOUT_H 0x3B
+
 // ---------- WIFI / TELEGRAM ----------
-const char* WIFI_SSID = "NOMBRE RED WIFI";
+const char* WIFI_SSID = "NOMBRE WIFI";
 const char* WIFI_PASS = "CONTRASEÑA WIFI";
 
-const String BOT_TOKEN = "TOKEN TELEGRAM";
+const String BOT_TOKEN = "TOKEN";
 const String CHAT_ID   = "1514893281";
 // -------------------------------------
 
@@ -42,10 +46,13 @@ const int SERVO_CERRADO = 0;
 const int SERVO_ABIERTO = 90;
 
 // Inclinación
-float anguloInicial = 0.0;
+int16_t AcX, AcY, AcZ;
+float refAngleX = 0.0;
+float refAngleY = 0.0;
 bool calibrado = false;
-const float UMBRAL_ACTIVAR = 20.0;
-const float UMBRAL_DESACTIVAR = 8.0;
+
+const float UMBRAL_ACTIVAR = 0.5;
+const float UMBRAL_DESACTIVAR = 5.0;
 
 // Máquina de estados principal
 enum EstadoSistema {
@@ -69,7 +76,7 @@ const unsigned long DENEGADO_TIEMPO_OFF = 120;
 // Pitido acceso autorizado
 bool pitidoAccesoActivo = false;
 unsigned long pitidoAccesoInicio = 0;
-const unsigned long PITIDO_ACCESO_DURACION = 80;
+const unsigned long PITIDO_ACCESO_DURACION = 180;
 
 // Anti-relectura
 bool tarjetaProcesada = false;
@@ -83,7 +90,6 @@ bool wifiConectado = false;
 bool telegramPendiente = false;
 String mensajeTelegramPendiente = "";
 unsigned long telegramEnviarDespues = 0;
-// ----------------------------------------
 
 // ---------------- TELEGRAM ----------------
 
@@ -201,31 +207,76 @@ void apagarBuzzer() {
   digitalWrite(BUZZER_PIN, LOW);
 }
 
-void leerMPU(float &ax, float &ay, float &az) {
+// ---------------- MPU-6500 ----------------
+
+void writeMPU(byte reg, byte data) {
   Wire.beginTransmission(MPU_ADDR);
-  Wire.write(0x3B);
+  Wire.write(reg);
+  Wire.write(data);
+  Wire.endTransmission();
+}
+
+void readAccel() {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(ACCEL_XOUT_H);
   Wire.endTransmission(false);
   Wire.requestFrom(MPU_ADDR, 6, true);
 
   if (Wire.available() >= 6) {
-    ax = (Wire.read() << 8 | Wire.read()) / 16384.0;
-    ay = (Wire.read() << 8 | Wire.read()) / 16384.0;
-    az = (Wire.read() << 8 | Wire.read()) / 16384.0;
+    AcX = (Wire.read() << 8) | Wire.read();
+    AcY = (Wire.read() << 8) | Wire.read();
+    AcZ = (Wire.read() << 8) | Wire.read();
   }
 }
 
-float obtenerDiferenciaInclinacion() {
-  float ax = 0, ay = 0, az = 0;
-  leerMPU(ax, ay, az);
+float leerAnguloX() {
+  readAccel();
 
-  float anguloActual = atan2(ay, az) * 180.0 / PI;
+  float ax = AcX / 16384.0;
+  float ay = AcY / 16384.0;
+  float az = AcZ / 16384.0;
 
-  if (!calibrado) {
-    anguloInicial = anguloActual;
-    calibrado = true;
+  return atan2(ay, sqrt(ax * ax + az * az)) * 180.0 / PI;
+}
+
+float leerAnguloY() {
+  readAccel();
+
+  float ax = AcX / 16384.0;
+  float ay = AcY / 16384.0;
+  float az = AcZ / 16384.0;
+
+  return atan2(-ax, sqrt(ay * ay + az * az)) * 180.0 / PI;
+}
+
+float promedioAnguloX(int n) {
+  float suma = 0;
+  for (int i = 0; i < n; i++) {
+    suma += leerAnguloX();
+    delay(10);
   }
+  return suma / n;
+}
 
-  return abs(anguloActual - anguloInicial);
+float promedioAnguloY(int n) {
+  float suma = 0;
+  for (int i = 0; i < n; i++) {
+    suma += leerAnguloY();
+    delay(10);
+  }
+  return suma / n;
+}
+
+float obtenerDiferenciaInclinacion() {
+  float angleX = promedioAnguloX(5);
+  float angleY = promedioAnguloY(5);
+
+  float deltaX = angleX - refAngleX;
+  float deltaY = angleY - refAngleY;
+
+  float cambio = max(abs(deltaX), abs(deltaY));
+
+  return cambio;
 }
 
 bool leerTarjeta(byte *uidLeido, byte &uidSize) {
@@ -269,16 +320,18 @@ void imprimirUID(byte *uid, byte uidSize) {
 
 void iniciarPitidoAcceso() {
   pitidoAccesoActivo = true;
-  pitidoAccesoInicio = tiempoActual;
+  pitidoAccesoInicio = millis();
+  digitalWrite(LED_VERDE_PIN, HIGH);
   encenderBuzzer();
 }
 
 void actualizarPitidoAcceso() {
-  if (pitidoAccesoActivo && (tiempoActual - pitidoAccesoInicio >= PITIDO_ACCESO_DURACION)) {
-    if (!alarmaInclinacionActiva) {
+  if (pitidoAccesoActivo && (millis() - pitidoAccesoInicio >= PITIDO_ACCESO_DURACION)) {
+    pitidoAccesoActivo = false;
+
+    if (!alarmaInclinacionActiva && !denegadoActivo) {
       apagarBuzzer();
     }
-    pitidoAccesoActivo = false;
   }
 }
 
@@ -306,7 +359,7 @@ void actualizarDenegado() {
 
     if (digitalRead(LED_ROJO_PIN) == HIGH) {
       digitalWrite(LED_ROJO_PIN, LOW);
-      if (!alarmaInclinacionActiva) {
+      if (!alarmaInclinacionActiva && !pitidoAccesoActivo) {
         apagarBuzzer();
       }
     } else {
@@ -318,7 +371,7 @@ void actualizarDenegado() {
 
     if (denegadoPaso >= DENEGADO_TOTAL_PASOS) {
       digitalWrite(LED_ROJO_PIN, LOW);
-      if (!alarmaInclinacionActiva) {
+      if (!alarmaInclinacionActiva && !pitidoAccesoActivo) {
         apagarBuzzer();
       }
       denegadoActivo = false;
@@ -396,10 +449,17 @@ void setup() {
 
   Wire.begin(SDA_MPU, SCL_MPU);
 
-  Wire.beginTransmission(MPU_ADDR);
-  Wire.write(0x6B);
-  Wire.write(0);
-  Wire.endTransmission();
+  delay(1000);
+  Serial.println("Iniciando MPU...");
+
+  writeMPU(PWR_MGMT_1, 0x00);
+  delay(500);
+
+  Serial.println("No muevas la tapa (calibrando)...");
+  refAngleX = promedioAnguloX(50);
+  refAngleY = promedioAnguloY(50);
+  calibrado = true;
+  Serial.println("Referencia guardada");
 
   pinMode(LED_ROJO_PIN, OUTPUT);
   pinMode(LED_VERDE_PIN, OUTPUT);
@@ -442,7 +502,9 @@ void loop() {
 
   switch (estadoActual) {
     case ESTADO_CERRADA: {
-      digitalWrite(LED_VERDE_PIN, LOW);
+      if (!pitidoAccesoActivo) {
+        digitalWrite(LED_VERDE_PIN, LOW);
+      }
 
       if (hayTarjeta) {
         imprimirUID(uidLeido, uidSize);
