@@ -5,537 +5,274 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
+#include <ArduinoJson.h>
 #include <math.h>
 
+// --- CONFIGURACION DE RED ---
+const char* WIFI_SSID = "Wifi";
+const char* WIFI_PASS = "Contra-Wifi";
+const String serverIP = "192.168.80.24"; 
+const String BOT_TOKEN = "token";
+const String CHAT_ID   = "1514893281";
+
+// --- DEFINICION DE PINES ---
 #define SS_PIN 21
 #define RST_PIN 22
-
-// Pines
 #define SERVO_PIN 13
 #define LED_ROJO_PIN 4
 #define LED_VERDE_PIN 2
 #define LED_AMBAR_PIN 5
 #define BUZZER_PIN 27
-
-// MPU-6500
 #define SDA_MPU 25
 #define SCL_MPU 26
+
+// --- CONSTANTES DE HARDWARE ---
 #define MPU_ADDR 0x68
-
-#define PWR_MGMT_1   0x6B
-#define ACCEL_XOUT_H 0x3B
-
-// ---------- WIFI / TELEGRAM ----------
-const char* WIFI_SSID = "NOMBRE WIFI";
-const char* WIFI_PASS = "CONTRASEÑA WIFI";
-
-const String BOT_TOKEN = "TOKEN";
-const String CHAT_ID   = "1514893281";
-// -------------------------------------
-
-MFRC522 mfrc522(SS_PIN, RST_PIN);
-Servo servo;
-WiFiClientSecure client;
-
-// UID autorizado
-byte UID_AUTORIZADO[] = {0xF2, 0x1D, 0x25, 0x02};
-const byte UID_SIZE = 4;
-
-// Servo
 const int SERVO_CERRADO = 0;
 const int SERVO_ABIERTO = 90;
+const float UMBRAL_ACTIVAR = 5.0;
 
-// Inclinación
-int16_t AcX, AcY, AcZ;
-float refAngleX = 0.0;
-float refAngleY = 0.0;
-bool calibrado = false;
+// --- OBJETOS ---
+MFRC522 mfrc522(SS_PIN, RST_PIN);
+Servo servo;
+WiFiClient clientLocal;
+WiFiClientSecure clientSecure;
 
-const float UMBRAL_ACTIVAR = 0.5;
-const float UMBRAL_DESACTIVAR = 5.0;
-
-// Máquina de estados principal
-enum EstadoSistema {
-  ESTADO_CERRADA,
-  ESTADO_ABIERTA,
-  ESTADO_DENEGADO
-};
-
+// --- ESTADOS Y CONTROL ---
+enum EstadoSistema { ESTADO_CERRADA, ESTADO_ABIERTA, ESTADO_DENEGADO };
 EstadoSistema estadoActual = ESTADO_CERRADA;
 
 unsigned long tiempoActual = 0;
-
-// Acceso denegado
-bool denegadoActivo = false;
 unsigned long denegadoUltimoCambio = 0;
 int denegadoPaso = 0;
-const int DENEGADO_TOTAL_PASOS = 8;
-const unsigned long DENEGADO_TIEMPO_ON = 120;
-const unsigned long DENEGADO_TIEMPO_OFF = 120;
-
-// Pitido acceso autorizado
+bool denegadoActivo = false;
 bool pitidoAccesoActivo = false;
 unsigned long pitidoAccesoInicio = 0;
-const unsigned long PITIDO_ACCESO_DURACION = 180;
-
-// Anti-relectura
-bool tarjetaProcesada = false;
-
-// Alarma por inclinación
 bool alarmaInclinacionActiva = false;
+float refAngleX = 0.0, refAngleY = 0.0;
 
-// WiFi
-bool wifiConectado = false;
-
-bool telegramPendiente = false;
-String mensajeTelegramPendiente = "";
-unsigned long telegramEnviarDespues = 0;
-
-// ---------------- TELEGRAM ----------------
-
+// ---------------- COMUNICACION TELEGRAM ----------------
 String urlEncode(String str) {
   String encoded = "";
-  char c;
-  char code0;
-  char code1;
-
   for (int i = 0; i < str.length(); i++) {
-    c = str.charAt(i);
-
-    if (isalnum((unsigned char)c)) {
-      encoded += c;
-    } else if (c == ' ') {
-      encoded += "%20";
-    } else {
-      code1 = (c & 0x0F) + '0';
-      if ((c & 0x0F) > 9) code1 = (c & 0x0F) - 10 + 'A';
-
-      c = (c >> 4) & 0x0F;
-      code0 = c + '0';
-      if (c > 9) code0 = c - 10 + 'A';
-
+    char c = str.charAt(i);
+    if (isalnum(c)) encoded += c;
+    else if (c == ' ') encoded += "%20";
+    else {
       encoded += '%';
-      encoded += code0;
-      encoded += code1;
+      char buf[3];
+      sprintf(buf, "%02X", c);
+      encoded += buf;
     }
   }
   return encoded;
 }
 
-void conectarWiFi() {
-  if (WiFi.status() == WL_CONNECTED) {
-    wifiConectado = true;
-    return;
-  }
-
-  Serial.print("Conectando a WiFi");
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-
-  unsigned long inicio = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - inicio < 15000) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println();
-
-  if (WiFi.status() == WL_CONNECTED) {
-    wifiConectado = true;
-    Serial.println("WiFi conectado");
-    Serial.print("IP: ");
-    Serial.println(WiFi.localIP());
-  } else {
-    wifiConectado = false;
-    Serial.println("No se pudo conectar a WiFi");
-  }
-}
-
-void enviarTelegramAhora(String mensaje) {
-  if (WiFi.status() != WL_CONNECTED) {
-    conectarWiFi();
-  }
-
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("Telegram no enviado: sin WiFi");
-    return;
-  }
-
+void enviarTelegram(String mensaje) {
+  if (WiFi.status() != WL_CONNECTED) return;
   HTTPClient https;
-  client.setInsecure();
-
-  String url = "https://api.telegram.org/bot" + BOT_TOKEN +
-               "/sendMessage?chat_id=" + CHAT_ID +
-               "&text=" + urlEncode(mensaje);
-
-  if (https.begin(client, url)) {
-    int httpCode = https.GET();
-    Serial.print("Telegram HTTP code: ");
-    Serial.println(httpCode);
+  clientSecure.setInsecure();
+  String url = "https://api.telegram.org/bot" + BOT_TOKEN + "/sendMessage?chat_id=" + CHAT_ID + "&text=" + urlEncode(mensaje);
+  if (https.begin(clientSecure, url)) {
+    https.GET();
     https.end();
-  } else {
-    Serial.println("No se pudo iniciar conexion HTTPS con Telegram");
   }
 }
 
-void programarTelegram(String mensaje, unsigned long retrasoMs) {
-  telegramPendiente = true;
-  mensajeTelegramPendiente = mensaje;
-  telegramEnviarDespues = millis() + retrasoMs;
-}
-
-void actualizarTelegramPendiente() {
-  if (telegramPendiente && millis() >= telegramEnviarDespues) {
-    enviarTelegramAhora(mensajeTelegramPendiente);
-    telegramPendiente = false;
-    mensajeTelegramPendiente = "";
-  }
-}
-
-// ---------------- FUNCIONES GENERALES ----------------
-
-bool esAutorizado(byte *uid) {
-  for (byte i = 0; i < UID_SIZE; i++) {
-    if (uid[i] != UID_AUTORIZADO[i]) return false;
-  }
-  return true;
-}
-
-void encenderBuzzer() {
-  digitalWrite(BUZZER_PIN, HIGH);
-}
-
-void apagarBuzzer() {
-  digitalWrite(BUZZER_PIN, LOW);
-}
-
-// ---------------- MPU-6500 ----------------
-
+// ---------------- GESTION MPU-6500 ----------------
 void writeMPU(byte reg, byte data) {
   Wire.beginTransmission(MPU_ADDR);
-  Wire.write(reg);
-  Wire.write(data);
+  Wire.write(reg); Wire.write(data);
   Wire.endTransmission();
 }
 
-void readAccel() {
+void leerInclinacion(float &x, float &y) {
   Wire.beginTransmission(MPU_ADDR);
-  Wire.write(ACCEL_XOUT_H);
+  Wire.write(0x3B);
   Wire.endTransmission(false);
   Wire.requestFrom(MPU_ADDR, 6, true);
+  
+  int16_t ax = (Wire.read() << 8) | Wire.read();
+  int16_t ay = (Wire.read() << 8) | Wire.read();
+  int16_t az = (Wire.read() << 8) | Wire.read();
 
-  if (Wire.available() >= 6) {
-    AcX = (Wire.read() << 8) | Wire.read();
-    AcY = (Wire.read() << 8) | Wire.read();
-    AcZ = (Wire.read() << 8) | Wire.read();
+  x = atan2(ay, sqrt(pow(ax, 2) + pow(az, 2))) * 180.0 / PI;
+  y = atan2(-ax, sqrt(pow(ay, 2) + pow(az, 2))) * 180.0 / PI;
+}
+
+// ---------------- SONIDOS DEL BUZZER ----------------
+void sonidoAccesoCorto() {
+  digitalWrite(BUZZER_PIN, HIGH);
+  delay(120);
+  digitalWrite(BUZZER_PIN, LOW);
+}
+
+void sonidoDenegado4Tonos() {
+  for (int i = 0; i < 4; i++) {
+    digitalWrite(LED_ROJO_PIN, HIGH);
+    digitalWrite(BUZZER_PIN, HIGH);
+    delay(160);
+
+    digitalWrite(LED_ROJO_PIN, LOW);
+    digitalWrite(BUZZER_PIN, LOW);
+    delay(140);
   }
 }
 
-float leerAnguloX() {
-  readAccel();
+// ---------------- LOGICA DE PETICION API ----------------
+void ejecutarApertura();
+void ejecutarCierre();
+void ejecutarDenegado();
 
-  float ax = AcX / 16384.0;
-  float ay = AcY / 16384.0;
-  float az = AcZ / 16384.0;
+void procesarAccesoRFID(String uid) {
+  if (WiFi.status() != WL_CONNECTED) return;
+  
+  HTTPClient http;
+  String url = "http://" + serverIP + ":3000/api/verificar/" + uid;
 
-  return atan2(ay, sqrt(ax * ax + az * az)) * 180.0 / PI;
-}
+  if (http.begin(clientLocal, url)) {
+    int httpCode = http.GET();
+    if (httpCode == 200) {
+      String payload = http.getString();
+      StaticJsonDocument<200> doc;
+      deserializeJson(doc, payload);
+      
+      bool acceso = doc["acceso"];
+      String operacion = doc["operacion"]; // 'abrir' o 'cerrar'
+      String nombre = doc["nombre"];
 
-float leerAnguloY() {
-  readAccel();
-
-  float ax = AcX / 16384.0;
-  float ay = AcY / 16384.0;
-  float az = AcZ / 16384.0;
-
-  return atan2(-ax, sqrt(ay * ay + az * az)) * 180.0 / PI;
-}
-
-float promedioAnguloX(int n) {
-  float suma = 0;
-  for (int i = 0; i < n; i++) {
-    suma += leerAnguloX();
-    delay(10);
-  }
-  return suma / n;
-}
-
-float promedioAnguloY(int n) {
-  float suma = 0;
-  for (int i = 0; i < n; i++) {
-    suma += leerAnguloY();
-    delay(10);
-  }
-  return suma / n;
-}
-
-float obtenerDiferenciaInclinacion() {
-  float angleX = promedioAnguloX(5);
-  float angleY = promedioAnguloY(5);
-
-  float deltaX = angleX - refAngleX;
-  float deltaY = angleY - refAngleY;
-
-  float cambio = max(abs(deltaX), abs(deltaY));
-
-  return cambio;
-}
-
-bool leerTarjeta(byte *uidLeido, byte &uidSize) {
-  if (!mfrc522.PICC_IsNewCardPresent()) {
-    tarjetaProcesada = false;
-    return false;
-  }
-
-  if (tarjetaProcesada) {
-    return false;
-  }
-
-  if (!mfrc522.PICC_ReadCardSerial()) {
-    return false;
-  }
-
-  uidSize = mfrc522.uid.size;
-  for (byte i = 0; i < uidSize; i++) {
-    uidLeido[i] = mfrc522.uid.uidByte[i];
-  }
-
-  tarjetaProcesada = true;
-
-  mfrc522.PICC_HaltA();
-  mfrc522.PCD_StopCrypto1();
-
-  return true;
-}
-
-void imprimirUID(byte *uid, byte uidSize) {
-  Serial.print("UID leído: ");
-  for (byte i = 0; i < uidSize; i++) {
-    if (uid[i] < 0x10) Serial.print("0");
-    Serial.print(uid[i], HEX);
-    Serial.print(" ");
-  }
-  Serial.println();
-}
-
-// ---------------- SONIDOS ----------------
-
-void iniciarPitidoAcceso() {
-  pitidoAccesoActivo = true;
-  pitidoAccesoInicio = millis();
-  digitalWrite(LED_VERDE_PIN, HIGH);
-  encenderBuzzer();
-}
-
-void actualizarPitidoAcceso() {
-  if (pitidoAccesoActivo && (millis() - pitidoAccesoInicio >= PITIDO_ACCESO_DURACION)) {
-    pitidoAccesoActivo = false;
-
-    if (!alarmaInclinacionActiva && !denegadoActivo) {
-      apagarBuzzer();
+      if (acceso) {
+        Serial.println("Acceso: " + nombre + " | Operacion: " + operacion);
+        if (operacion == "abrir") ejecutarApertura();
+        else if (operacion == "cerrar") ejecutarCierre();
+      } else {
+        ejecutarDenegado();
+      }
     }
+    http.end();
   }
 }
 
-void iniciarDenegado() {
+// ---------------- ACCIONES FISICAS ----------------
+void ejecutarDenegado() {
   estadoActual = ESTADO_DENEGADO;
   denegadoActivo = true;
   denegadoPaso = 0;
-  denegadoUltimoCambio = tiempoActual;
+  denegadoUltimoCambio = millis();
 
-  digitalWrite(LED_ROJO_PIN, HIGH);
-  encenderBuzzer();
+  enviarTelegram("Alerta: Intento de acceso denegado.");
 
-  Serial.println("Acceso DENEGADO");
+  // 4 tonos intermitentes
+  sonidoDenegado4Tonos();
 
-  programarTelegram("Acceso denegado en la vitrina", 1200);
-}
+  denegadoActivo = false;
+  estadoActual = ESTADO_CERRADA;
 
-void actualizarDenegado() {
-  if (!denegadoActivo) return;
-
-  unsigned long intervalo = (digitalRead(LED_ROJO_PIN) == HIGH) ? DENEGADO_TIEMPO_ON : DENEGADO_TIEMPO_OFF;
-
-  if (tiempoActual - denegadoUltimoCambio >= intervalo) {
-    denegadoUltimoCambio = tiempoActual;
-
-    if (digitalRead(LED_ROJO_PIN) == HIGH) {
-      digitalWrite(LED_ROJO_PIN, LOW);
-      if (!alarmaInclinacionActiva && !pitidoAccesoActivo) {
-        apagarBuzzer();
-      }
-    } else {
-      digitalWrite(LED_ROJO_PIN, HIGH);
-      encenderBuzzer();
-    }
-
-    denegadoPaso++;
-
-    if (denegadoPaso >= DENEGADO_TOTAL_PASOS) {
-      digitalWrite(LED_ROJO_PIN, LOW);
-      if (!alarmaInclinacionActiva && !pitidoAccesoActivo) {
-        apagarBuzzer();
-      }
-      denegadoActivo = false;
-      estadoActual = ESTADO_CERRADA;
-      Serial.println("Sistema vuelve a estado CERRADA");
-    }
+  // Si justo hay alerta sospechosa activa, devuelve el buzzer a continuo
+  if (alarmaInclinacionActiva) {
+    digitalWrite(BUZZER_PIN, HIGH);
+    digitalWrite(LED_AMBAR_PIN, HIGH);
+  } else {
+    digitalWrite(BUZZER_PIN, LOW);
+    digitalWrite(LED_ROJO_PIN, LOW);
   }
 }
 
-// ---------------- ACCIONES ----------------
-
-void abrirVitrina() {
+void ejecutarApertura() {
   servo.write(SERVO_ABIERTO);
   digitalWrite(LED_VERDE_PIN, HIGH);
-  iniciarPitidoAcceso();
   estadoActual = ESTADO_ABIERTA;
-  Serial.println("Acceso CONCEDIDO - ABRIENDO");
 
-  programarTelegram("La puerta de la vitrina fue ABIERTA", 250);
+  // 1 tono corto
+  sonidoAccesoCorto();
+
+  enviarTelegram("Vitrina ABIERTA - Sesion iniciada.");
 }
 
-void cerrarVitrina() {
+void ejecutarCierre() {
   servo.write(SERVO_CERRADO);
   digitalWrite(LED_VERDE_PIN, LOW);
   estadoActual = ESTADO_CERRADA;
-  Serial.println("Acceso CONCEDIDO - CERRANDO");
 
-  programarTelegram("La puerta de la vitrina fue CERRADA", 250);
+  // 1 tono corto
+  sonidoAccesoCorto();
+
+  enviarTelegram("Vitrina CERRADA - Sesion finalizada.");
 }
 
-void actualizarAlarmaInclinacion(float diferenciaInclinacion) {
-  if (estadoActual == ESTADO_CERRADA) {
-    if (diferenciaInclinacion > UMBRAL_ACTIVAR) {
-      if (!alarmaInclinacionActiva) {
-        alarmaInclinacionActiva = true;
-        digitalWrite(LED_AMBAR_PIN, HIGH);
-        encenderBuzzer();
-        Serial.println("ALERTA: Inclinacion sospechosa!");
-
-        programarTelegram("Alerta: inclinacion sospechosa detectada en la vitrina", 100);
-      } else {
-        digitalWrite(LED_AMBAR_PIN, HIGH);
-        encenderBuzzer();
-      }
-    } else if (diferenciaInclinacion < UMBRAL_DESACTIVAR) {
-      if (alarmaInclinacionActiva) {
-        alarmaInclinacionActiva = false;
-        digitalWrite(LED_AMBAR_PIN, LOW);
-        if (!pitidoAccesoActivo && !denegadoActivo) {
-          apagarBuzzer();
-        }
-        Serial.println("Inclinacion normal nuevamente");
-
-        programarTelegram("La vitrina volvió a una posicion recta/normal", 100);
-      }
-    }
-  } else {
-    if (alarmaInclinacionActiva) {
-      alarmaInclinacionActiva = false;
-      digitalWrite(LED_AMBAR_PIN, LOW);
-      if (!pitidoAccesoActivo && !denegadoActivo) {
-        apagarBuzzer();
-      }
-    }
-  }
-}
-
-// ---------------- SETUP ----------------
-
+// ---------------- CONFIGURACION INICIAL ----------------
 void setup() {
   Serial.begin(115200);
-
   SPI.begin();
   mfrc522.PCD_Init();
-
   Wire.begin(SDA_MPU, SCL_MPU);
-
-  delay(1000);
-  Serial.println("Iniciando MPU...");
-
-  writeMPU(PWR_MGMT_1, 0x00);
+  
+  writeMPU(0x6B, 0x00);
   delay(500);
-
-  Serial.println("No muevas la tapa (calibrando)...");
-  refAngleX = promedioAnguloX(50);
-  refAngleY = promedioAnguloY(50);
-  calibrado = true;
-  Serial.println("Referencia guardada");
+  leerInclinacion(refAngleX, refAngleY);
 
   pinMode(LED_ROJO_PIN, OUTPUT);
   pinMode(LED_VERDE_PIN, OUTPUT);
   pinMode(LED_AMBAR_PIN, OUTPUT);
   pinMode(BUZZER_PIN, OUTPUT);
+  
+  servo.attach(SERVO_PIN, 500, 2400);
+  servo.write(SERVO_CERRADO);
 
   digitalWrite(LED_ROJO_PIN, LOW);
   digitalWrite(LED_VERDE_PIN, LOW);
   digitalWrite(LED_AMBAR_PIN, LOW);
   digitalWrite(BUZZER_PIN, LOW);
 
-  servo.setPeriodHertz(50);
-  servo.attach(SERVO_PIN, 500, 2400);
-  servo.write(SERVO_CERRADO);
-
-  conectarWiFi();
-  enviarTelegramAhora("Sistema de vitrina iniciado y conectado");
-
-  Serial.println("Sistema listo. Acerca una tarjeta...");
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi OK. IP: " + WiFi.localIP().toString());
+  enviarTelegram("Sistema de Vitrina Operativo.");
 }
 
-// ---------------- LOOP ----------------
-
+// ---------------- BUCLE PRINCIPAL ----------------
 void loop() {
   tiempoActual = millis();
 
-  if (WiFi.status() != WL_CONNECTED) {
-    wifiConectado = false;
+  // 1. Monitoreo de seguridad (MPU)
+  float curX, curY;
+  leerInclinacion(curX, curY);
+  float diff = max(abs(curX - refAngleX), abs(curY - refAngleY));
+
+  if (estadoActual == ESTADO_CERRADA) {
+    if (diff > UMBRAL_ACTIVAR && !alarmaInclinacionActiva) {
+      alarmaInclinacionActiva = true;
+      digitalWrite(LED_AMBAR_PIN, HIGH);
+
+      // tono continuo
+      if (!denegadoActivo) {
+        digitalWrite(BUZZER_PIN, HIGH);
+      }
+
+      enviarTelegram("ALERTA: Movimiento no autorizado detectado.");
+    } else if (diff < UMBRAL_ACTIVAR && alarmaInclinacionActiva) {
+      alarmaInclinacionActiva = false;
+      digitalWrite(LED_AMBAR_PIN, LOW);
+
+      if (!denegadoActivo) {
+        digitalWrite(BUZZER_PIN, LOW);
+      }
+    }
   }
 
-  actualizarPitidoAcceso();
-  actualizarTelegramPendiente();
-
-  float diferenciaInclinacion = obtenerDiferenciaInclinacion();
-  actualizarAlarmaInclinacion(diferenciaInclinacion);
-
-  byte uidLeido[10];
-  byte uidSize = 0;
-  bool hayTarjeta = leerTarjeta(uidLeido, uidSize);
-
-  switch (estadoActual) {
-    case ESTADO_CERRADA: {
-      if (!pitidoAccesoActivo) {
-        digitalWrite(LED_VERDE_PIN, LOW);
-      }
-
-      if (hayTarjeta) {
-        imprimirUID(uidLeido, uidSize);
-
-        if (uidSize == UID_SIZE && esAutorizado(uidLeido)) {
-          abrirVitrina();
-        } else {
-          iniciarDenegado();
-        }
-      }
-      break;
+  // 2. Lectura RFID
+  if (mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial()) {
+    String uidLeido = "";
+    for (byte i = 0; i < mfrc522.uid.size; i++) {
+      uidLeido += String(mfrc522.uid.uidByte[i] < 0x10 ? "0" : "");
+      uidLeido += String(mfrc522.uid.uidByte[i], HEX);
     }
-
-    case ESTADO_ABIERTA: {
-      digitalWrite(LED_VERDE_PIN, HIGH);
-
-      if (hayTarjeta) {
-        imprimirUID(uidLeido, uidSize);
-
-        if (uidSize == UID_SIZE && esAutorizado(uidLeido)) {
-          cerrarVitrina();
-        } else {
-          iniciarDenegado();
-        }
-      }
-      break;
-    }
-
-    case ESTADO_DENEGADO: {
-      actualizarDenegado();
-      break;
-    }
+    uidLeido.toUpperCase();
+    procesarAccesoRFID(uidLeido);
+    mfrc522.PICC_HaltA();
+    mfrc522.PCD_StopCrypto1();
   }
 }
