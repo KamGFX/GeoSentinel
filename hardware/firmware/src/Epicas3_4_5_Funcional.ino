@@ -10,9 +10,9 @@
 
 // --- CONFIGURACION DE RED ---
 const char* WIFI_SSID = "Wifi";
-const char* WIFI_PASS = "Contra-Wifi";
+const char* WIFI_PASS = "Contraseña Wifi";
 const String serverIP = "192.168.80.24"; 
-const String BOT_TOKEN = "token";
+const String BOT_TOKEN = "Token";
 const String CHAT_ID   = "1514893281";
 
 // --- DEFINICION DE PINES ---
@@ -193,9 +193,6 @@ void ejecutarCierre() {
   servo.write(SERVO_CERRADO);
   digitalWrite(LED_VERDE_PIN, LOW);
   estadoActual = ESTADO_CERRADA;
-
-  // 1 tono corto
-  sonidoAccesoCorto();
 
   enviarTelegram("Vitrina CERRADA - Sesion finalizada.");
 }
